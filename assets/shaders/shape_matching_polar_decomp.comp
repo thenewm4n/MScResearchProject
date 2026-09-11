@@ -1,0 +1,154 @@
+// #version 430 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle
+{
+    vec4 initialPosition;       // w = fixed flag
+    vec4 currentPosition;       // w = density
+    vec4 velocity;              // w = pressure
+    ivec4 clusterIDsA;
+    ivec4 clusterIDsB;
+};
+
+struct ParticleCluster
+{
+    mat4 rotationMatrix;
+    vec4 initialCentreOfMass;
+    vec4 currentCentreOfMass;
+    int numParticles;
+    vec3 padding;
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer
+{
+    Particle particles[];
+};
+
+layout(std430, binding = 1) buffer ClusterBuffer
+{
+    ParticleCluster clusters[];
+};
+
+uniform int numClusters;
+uniform int numParticles;
+
+
+bool calculateClusterCentresOfMass(uint id, out vec3 initialCentreOfMass, out vec3 currentCentreOfMass)
+{
+    int numParticlesInCluster = 0;
+    initialCentreOfMass = vec3(0.0);
+    currentCentreOfMass = vec3(0.0);
+    
+    for (int i = 0; i < numParticles; i++)
+    {
+        bool inCluster =
+        (
+            particles[i].clusterIDsA[0] == id ||
+            particles[i].clusterIDsA[1] == id ||
+            particles[i].clusterIDsA[2] == id ||
+            particles[i].clusterIDsA[3] == id ||
+            particles[i].clusterIDsB[0] == id ||
+            particles[i].clusterIDsB[1] == id ||
+            particles[i].clusterIDsB[2] == id ||
+            particles[i].clusterIDsB[3] == id
+        );
+
+        if (inCluster)
+        {
+            numParticlesInCluster++;
+            initialCentreOfMass += particles[i].initialPosition.xyz;
+            currentCentreOfMass += particles[i].currentPosition.xyz;
+        }
+    }
+
+    clusters[id].numParticles = numParticlesInCluster;
+
+    // If cluster lacks 3D volume required for stable matrix, reset and return
+    if (numParticlesInCluster <= 4)
+    {
+        clusters[id].initialCentreOfMass = vec4(0.0);
+        clusters[id].currentCentreOfMass = vec4(0.0);
+        clusters[id].rotationMatrix = mat4(1.0);
+        return false;
+    }
+
+    initialCentreOfMass /= float(numParticlesInCluster);
+    currentCentreOfMass /= float(numParticlesInCluster);
+
+    clusters[id].initialCentreOfMass = vec4(initialCentreOfMass, 0.0);
+    clusters[id].currentCentreOfMass = vec4(currentCentreOfMass, 0.0);
+
+    return true;
+}
+
+mat3 calculateCovarianceMatrix(uint id, vec3 initialCentreOfMass, vec3 currentCentreOfMass)
+{
+    mat3 A = mat3(0.0);
+    for (int i = 0; i < numParticles; i++)
+    {
+        bool inCluster =
+        (
+            particles[i].clusterIDsA[0] == id ||
+            particles[i].clusterIDsA[1] == id ||
+            particles[i].clusterIDsA[2] == id ||
+            particles[i].clusterIDsA[3] == id ||
+            particles[i].clusterIDsB[0] == id ||
+            particles[i].clusterIDsB[1] == id ||
+            particles[i].clusterIDsB[2] == id ||
+            particles[i].clusterIDsB[3] == id
+        );
+
+        if (inCluster)
+        {
+            vec3 initialOffsetFromCentreOfMass = particles[i].initialPosition.xyz - initialCentreOfMass;
+            vec3 currentOffsetFromCentreOfMass = particles[i].currentPosition.xyz - currentCentreOfMass;
+            A += outerProduct(currentOffsetFromCentreOfMass, initialOffsetFromCentreOfMass);
+        }
+    }
+
+    return A;
+}
+
+mat3 extractRotationMatrix(mat3 R)
+{
+    float determinant = determinant(R);
+    if (abs(determinant) < 0.0001)
+    {
+        return mat3(1.0);
+    }
+
+    float scale = pow(abs(determinant), 1.0 / 3.0);
+    R /= scale;
+
+    for (int i = 0; i < 5; i++)
+    {
+        R = 0.5 * (R + inverse(transpose(R)));
+    }
+    
+    return R;
+}
+
+
+void main() 
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= numClusters)
+    {
+        return;
+    }
+    
+    vec3 initialCentreOfMass;
+    vec3 currentCentreOfMass;
+
+    bool isValidCluster = calculateClusterCentresOfMass(id, initialCentreOfMass, currentCentreOfMass);
+    if (!isValidCluster)
+    {
+        return;
+    }
+
+    mat3 R = calculateCovarianceMatrix(id, initialCentreOfMass, currentCentreOfMass);
+    mat3 rotationMatrix = extractRotationMatrix(R);
+
+    clusters[id].rotationMatrix = mat4(rotationMatrix);
+}

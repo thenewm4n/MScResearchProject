@@ -1,0 +1,270 @@
+// #version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define PI 3.141592653589793
+
+
+// SPH uniforms
+uniform int numParticles;
+uniform float mass;
+uniform float smoothingRadius;
+uniform float viscosity;
+uniform float deltaTime;
+uniform float currentContractionStrength;
+
+// Shape matching uniforms
+uniform float shapeMatchingStiffness;
+
+// SDF collision uniforms
+uniform sampler3D skullSDFTextureUnit;
+uniform vec3 skullSDFBoundingBoxMin;
+uniform vec3 skullSDFBoundingBoxMax;
+
+// Soft tissue constraint uniforms
+uniform float adhesionStrength;
+uniform float softTissueStiffness;
+
+
+struct Particle
+{
+    vec4 initialPosition;       // w = fixed flag
+    vec4 currentPosition;       // w = density
+    vec4 velocity;              // w = pressure
+    ivec4 clusterIDsA;
+    ivec4 clusterIDsB;
+};
+
+struct ParticleCluster
+{
+    mat4 rotationMatrix;
+    vec4 initialCentreOfMass;
+    vec4 currentCentreOfMass;
+    int numParticles;
+    vec3 padding;
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer
+{
+    Particle particles[];
+};
+
+layout(std430, binding = 1) buffer ClusterBuffer
+{
+    ParticleCluster clusters[];
+};
+
+
+vec3 spikyKernelGradient(vec3 distanceVector, float distance, float smoothingRadius)
+{
+    if (distance == 0.0 || distance >= smoothingRadius)
+    {
+        return vec3(0.0);
+    }
+    
+    float radiusMinusDistance = smoothingRadius - distance;
+   
+    // Derivative formula for magnitude
+    float magnitude = -45.0 / (PI * pow(smoothingRadius, 6.0)) * (radiusMinusDistance * radiusMinusDistance);
+    
+    return (distanceVector / distance) * magnitude;
+}
+
+float viscosityKernelLaplacian(float distance, float smoothingRadius)
+{
+    if (distance < 0.0 || distance >= smoothingRadius)
+    {
+        return 0.0;
+    }
+    
+    return (45.0 / (PI * pow(smoothingRadius, 6.0))) * (smoothingRadius - distance);
+}
+
+vec3 clusterShapeMatching(uint id, vec3 thisPosition)
+{
+    vec3 shapeMatchingVelocityCorrection = vec3(0.0);
+    int numClusters = 0;
+    int clusterIds[8] =
+    {
+        particles[id].clusterIDsA[0],
+        particles[id].clusterIDsA[1],
+        particles[id].clusterIDsA[2],
+        particles[id].clusterIDsA[3],
+        particles[id].clusterIDsB[0],
+        particles[id].clusterIDsB[1],
+        particles[id].clusterIDsB[2],
+        particles[id].clusterIDsB[3]
+    };
+
+    for (int i = 0; i < 8; i++)
+    {
+        if (clusterIds[i] != -1)
+        {
+            ParticleCluster cluster = clusters[clusterIds[i]];
+            if (cluster.numParticles > 4)
+            {
+                numClusters++;
+
+                vec3 initialRelativePosition = particles[id].initialPosition.xyz - cluster.initialCentreOfMass.xyz;
+                vec3 goalPosition = cluster.currentCentreOfMass.xyz + (mat3(cluster.rotationMatrix) * initialRelativePosition);
+                shapeMatchingVelocityCorrection += shapeMatchingStiffness * ((goalPosition - thisPosition) / deltaTime);
+            }
+        }
+    }
+
+    if (numClusters > 1)
+    {
+        shapeMatchingVelocityCorrection /= float(numClusters);
+    }
+
+    return shapeMatchingVelocityCorrection;
+}
+
+float getSkullSignedDistance(vec3 position)
+{
+    vec3 textureCoordinates = (position - skullSDFBoundingBoxMin) / (skullSDFBoundingBoxMax - skullSDFBoundingBoxMin);
+    
+    if (textureCoordinates.x < 0.0 ||
+        textureCoordinates.x > 1.0 ||
+        textureCoordinates.y < 0.0 ||
+        textureCoordinates.y > 1.0 ||
+        textureCoordinates.z < 0.0 ||
+        textureCoordinates.z > 1.0)
+    {
+        return 1.0; 
+    }
+    
+    return texture(skullSDFTextureUnit, textureCoordinates).r;
+}
+
+vec3 getSkullSurfaceNormal(vec3 position)
+{
+    // Sample distance slightly along each axis to find gradient
+    float epsilon = 0.01;
+    
+    float deltaX = getSkullSignedDistance(position + vec3(epsilon, 0.0, 0.0)) - getSkullSignedDistance(position - vec3(epsilon, 0.0, 0.0));
+    float deltaY = getSkullSignedDistance(position + vec3(0.0, epsilon, 0.0)) - getSkullSignedDistance(position - vec3(0.0, epsilon, 0.0));
+    float deltaZ = getSkullSignedDistance(position + vec3(0.0, 0.0, epsilon)) - getSkullSignedDistance(position - vec3(0.0, 0.0, epsilon));
+   
+
+    return normalize(vec3(deltaX, deltaY, deltaZ));
+}
+
+
+void main() 
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= numParticles)
+    {
+        return;
+    }
+
+    vec3 thisPosition = particles[id].currentPosition.xyz;
+    vec3 thisVelocity = particles[id].velocity.xyz;
+    float thisDensity = particles[id].currentPosition.w;
+    float thisPressure = particles[id].velocity.w;
+
+    vec3 pressureForce = vec3(0.0);
+    vec3 viscosityForce = vec3(0.0);
+
+    for (int i = 0; i < numParticles; i++)
+    {
+        if (i == id)
+        {
+            continue;
+        }
+
+        vec3 neighbourPosition = particles[i].currentPosition.xyz;
+        float distance = length(thisPosition - neighbourPosition);
+
+        if (distance > 0.0 && distance < smoothingRadius)
+        {
+            vec3 neighbourVelocity = particles[i].velocity.xyz;
+            float neighbourDensity = particles[i].currentPosition.w;
+            float neighbourPressure = particles[i].velocity.w;
+
+            // Pressure force
+            vec3 gradient = spikyKernelGradient(thisPosition - neighbourPosition, distance, smoothingRadius);
+            pressureForce += -mass * ((thisPressure + neighbourPressure) / (2.0 * neighbourDensity)) * gradient;
+
+            // Viscosity force
+            float laplacian = viscosityKernelLaplacian(distance, smoothingRadius);
+            viscosityForce += viscosity * mass * ((neighbourVelocity - thisVelocity) / neighbourDensity) * laplacian;
+        }
+    }
+
+    vec3 totalSPHForce = pressureForce + viscosityForce;
+    thisDensity = thisDensity < 0.0001 ? 0.0001 : thisDensity;          // Prevent divide by zero if density abnormally low
+
+    vec3 acceleration = totalSPHForce / thisDensity;
+
+    // Soft tissue effect
+    acceleration += vec3(0.0, -9.81, 0.0);                              // Gravity
+    vec3 displacementFromInitialPosition = thisPosition - particles[id].initialPosition.xyz;
+    acceleration -= softTissueStiffness * displacementFromInitialPosition;
+
+    // Determine muscle fibre direction and move particle accordingly
+    vec3 upVector = vec3(0.0, 1.0, 0.0);
+    vec3 surfaceNormal = getSkullSurfaceNormal(thisPosition);
+    vec3 tangent = upVector - (dot(upVector, surfaceNormal) * surfaceNormal);
+    if (length(tangent) > 0.0001)
+    {
+        vec3 normalisedTangent = normalize(tangent);
+        acceleration += currentContractionStrength * normalisedTangent;
+    }
+
+    // Skin constraint
+    float particleDistanceToSkull = getSkullSignedDistance(thisPosition);
+    float skinConstraintMaxDistance = 2.0 * smoothingRadius;
+    if (particleDistanceToSkull > 0 && particleDistanceToSkull < skinConstraintMaxDistance)
+    {
+        acceleration += adhesionStrength * -surfaceNormal;
+    }
+
+    // Clamp acceleartion; stops particle explosions due to large time step
+    float maxAccelerationMagnitude = 10.0;
+    if (length(acceleration) > maxAccelerationMagnitude)
+    {
+        acceleration = maxAccelerationMagnitude * normalize(acceleration);
+    }
+
+    // Leap frog integration
+    float maxSpeed = 2.5;
+    vec3 shapeMatchingVelocityCorrection = clusterShapeMatching(id, thisPosition);
+    if (particles[id].initialPosition.w != 1.0)
+    {
+        thisVelocity += deltaTime * acceleration;
+        thisVelocity *= 0.87;                           // Damping
+
+        if (length(thisVelocity) > maxSpeed)
+        {
+            thisVelocity = maxSpeed * normalize(thisVelocity);
+        }
+
+        thisVelocity += shapeMatchingVelocityCorrection;
+
+        thisPosition += deltaTime * thisVelocity;
+
+        // SDF collision detection and resolution
+        float distanceToSkull = getSkullSignedDistance(thisPosition);
+        float softTissueThickness = 0.02;
+        if (distanceToSkull < softTissueThickness) 
+        {
+            vec3 surfaceNormal = getSkullSurfaceNormal(thisPosition);
+            thisPosition += surfaceNormal * (abs(distanceToSkull) + softTissueThickness);
+            
+            float velocityAlongNormal = dot(thisVelocity, surfaceNormal);
+            if (velocityAlongNormal < 0.0)
+            {
+                thisVelocity -= surfaceNormal * velocityAlongNormal;
+            }
+        }
+    }
+    else
+    {
+        thisVelocity = vec3(0.0);
+    }
+
+    particles[id].currentPosition.xyz = thisPosition;
+    particles[id].velocity.xyz = thisVelocity;
+}

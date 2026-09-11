@@ -1,0 +1,65 @@
+// #version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define PI 3.141592653589793
+
+
+struct Particle
+{
+    vec4 initialPosition;       // w = fixed flag
+    vec4 currentPosition;       // w = density
+    vec4 velocity;              // w = pressure
+    ivec4 clusterIDsA;
+    ivec4 clusterIDsB;
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer
+{
+    Particle particles[];
+};
+
+uniform int numParticles;
+uniform float mass;
+uniform float smoothingRadius;
+uniform float restDensity;
+uniform float sphStiffness;
+
+float poly6Kernel(float distance, float smoothingRadius)     // Smoothing kernel
+{
+    if (distance < 0.0 || distance >= smoothingRadius)
+    {
+        return 0.0;
+    }
+    
+    float radiusSquaredMinusDistanceSquared = (smoothingRadius * smoothingRadius) - (distance * distance);
+    
+    return (315.0 / (64.0 * PI * pow(smoothingRadius, 9.0))) * pow(radiusSquaredMinusDistanceSquared, 3.0);
+}
+
+
+void main() 
+{
+    uint id = gl_GlobalInvocationID.x;
+    
+    // To prevent shader being performed on left over threads
+    if (id >= numParticles)
+    {
+        return;
+    }
+
+    vec3 thisPosition = particles[id].currentPosition.xyz;
+    float density = 0.0;
+
+    for (int i = 0; i < numParticles; i++)
+    {
+        vec3 neighbourPosition = particles[i].currentPosition.xyz;
+        float distance = length(thisPosition - neighbourPosition);
+        density += mass * poly6Kernel(distance, smoothingRadius);
+    }
+
+    float pressure = max((density - restDensity) * sphStiffness, 0.0);
+
+    particles[id].currentPosition.w = density;
+    particles[id].velocity.w = pressure;
+}
